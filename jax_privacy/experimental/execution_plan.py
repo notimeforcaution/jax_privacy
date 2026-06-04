@@ -14,7 +14,9 @@
 
 """Module for defining DP Execution Plans.
 
-**API Stability: 5/10 -- Subject to change!**
+**API Stability:**
+- `DPExecutionPlan`: 10/10 -- Stable.
+- `BandMFExecutionPlanConfig`: 7/10 -- Mostly stable, minor changes possible.
 
 # Writing General-Purpose DP Training Loops via DPExecutionPlan
 
@@ -146,56 +148,14 @@ class DPExecutionPlan:
       and aggregated gradients after each iteration.
     dp_event: Characterizes the mechanism in terms of primitive building blocks
       that dp_accounting knows how to analyze.
+    neighboring_relation: The DP neighboring relation assumed by this mechanism.
   """
 
   clipped_grad: Callable[..., clipping.BoundedSensitivityCallable]
   batch_selection_strategy: batch_selection.BatchSelectionStrategy
   noise_addition_transform: optax.GradientTransformation
   dp_event: dp_accounting.DpEvent
-
-
-def _validate_epsilon_delta_noise_multiplier(
-    epsilon: float | None,
-    delta: float | None,
-    noise_multiplier: float | None,
-):
-  """Validates exactly one of (epsilon, delta) or noise_multiplier is set."""
-  if (epsilon is None) != (delta is None):
-    raise ValueError('epsilon and delta must be either both None or both set.')
-  if (epsilon is None) == (noise_multiplier is None):
-    raise ValueError(
-        'Exactly one of (epsilon, delta), and noise_multiplier must be set.'
-    )
-
-
-def _validate_adjacency_relation(
-    accountant: dp_accounting.PrivacyAccountant,
-    truncated_batch_size: int | None,
-    partition_type: batch_selection.PartitionType,
-) -> None:
-  """Validates the adjacency relation is compatible with the config."""
-  neighboring_relation = accountant.neighboring_relation
-
-  if neighboring_relation is NeighboringRelation.ADD_OR_REMOVE_ONE:
-    if partition_type != batch_selection.PartitionType.INDEPENDENT:
-      raise ValueError(
-          f'{neighboring_relation=} is only compatible with INDEPENDENT'
-          f' partition_type, found {partition_type=}.'
-      )
-    if truncated_batch_size is not None:
-      raise ValueError(
-          f'{neighboring_relation=} does not support truncated_batch_size,'
-          f' found {truncated_batch_size=}.'
-      )
-
-  else:
-    if (
-        partition_type == batch_selection.PartitionType.INDEPENDENT
-        and truncated_batch_size is not None
-    ):
-      raise ValueError(
-          f'{partition_type=} is not compatible with {truncated_batch_size=}'
-      )
+  neighboring_relation: NeighboringRelation
 
 
 @pydantic.dataclasses.dataclass(
@@ -206,50 +166,58 @@ def _validate_adjacency_relation(
 class BandMFExecutionPlanConfig:
   """Configuration for an Amplified BandMF-based DPExecutionPlan.
 
+  (API: 7/10)
+
+  This config is designed to be fully serializable, defined in terms of simple
+  types. The DP neighboring relation, partition type, and other derived
+  quantities are inferred automatically from the config when `make()` or
+  `calibrate()` is called.
+
   The expected batch size of the batch selection strategy is
   `num_examples / num_bands * sampling_prob`. In most cases, `num_examples` is
   ignored because `num_examples` is considered a sensitive quantity under some
   DP definitions. The exception is when using truncation, where it is necessary
   for accounting (hence, one should be careful about the DP definition when
-  using truncation). The recommended way to configure this function is directly
-  via (epsilon, delta), however for convenience it can also be configured via
-  `noise_multiplier` by setting epsilon=delta=None.
+  using truncation).
 
-  Example Usage (Standard DP-SGD):
-  >>> config = BandMFExecutionPlanConfig.default(
-  ...     num_bands=1,
-  ...     iterations=1000,
-  ...     epsilon=1.0,
-  ...     delta=1e-5,
-  ...     sampling_prob=0.1,
-  ... )
+  The config can be created with or without a noise_multiplier. If created
+  without one, call `calibrate()` to obtain a new config with a noise_multiplier
+  calibrated to a target (epsilon, delta) guarantee.
 
-  Example Usage (BandMF with default strategy matrix):
-  >>> config = BandMFExecutionPlanConfig.default(
-  ...     num_bands=4,
-  ...     iterations=1000,
-  ...     epsilon=1.0,
-  ...     delta=1e-5,
-  ...     sampling_prob=0.4,
-  ... )
+  Example Usage (Calibrate from epsilon/delta)::
 
-  Example Usage (BandMF with custom strategy):
-  >>> config = BandMFExecutionPlanConfig(
-  ...     strategy=np.array([1.0, 0.5, 0.2, 0.1]),
-  ...     iterations=1000,
-  ...     epsilon=1.0,
-  ...     delta=1e-5,
-  ...     sampling_prob=0.4,
-  ... )
+    config = BandMFExecutionPlanConfig.default(
+        num_bands=1,
+        iterations=1000,
+        sampling_prob=0.1,
+    ).calibrate(epsilon=1.0, delta=1e-5)
+
+  Example Usage (Direct noise_multiplier)::
+
+    config = BandMFExecutionPlanConfig.default(
+        num_bands=1,
+        iterations=1000,
+        noise_multiplier=1.0,
+        sampling_prob=0.1,
+    )
+
+  Example Usage (BandMF with custom strategy)::
+
+    config = BandMFExecutionPlanConfig(
+        strategy=np.array([1.0, 0.5, 0.2, 0.1]),
+        iterations=1000,
+        sampling_prob=0.4,
+    ).calibrate(epsilon=1.0, delta=1e-5)
 
   References: https://arxiv.org/abs/2306.08153 and
   https://arxiv.org/abs/2405.15913
 
   Attributes:
-    epsilon: The desired privacy budget.
-    delta: Additional privacy parameter.
-    noise_multiplier: If specified, gives the standard deviation of the
-      uncorrelated gaussian noise used with the BandMF GradientPrivatizer.
+    noise_multiplier: The ratio of noise standard deviation to the query
+      sensitivity. The actual noise stddev is determined by this value, the
+      query sensitivity, and the strategy matrix column norm. If not set, use
+      `calibrate()` to automatically determine it from target (epsilon, delta)
+      privacy parameters.
     iterations: The number of iterations the mechanism is defined for. Tip: Set
       this to be a multiple of num_bands for the best utility.
     strategy: The toeplitz coefficeints of the BandMF strategy matrix.
@@ -262,23 +230,14 @@ class BandMFExecutionPlanConfig:
       return batches of size at most truncated_batch_size, and accounting will
       be based on truncated Poisson sampling (http://arxiv.org/html/2508.15089).
     num_examples: The number of examples in the dataset. Required when
-      truncated_batch_size is set. Should not be provided if
-      accountant.neighboring_relation is ADD_OR_REMOVE_ONE, since it is not
-      public information.
-    partition_type: How to partition the examples into groups for before Poisson
-      sampling. EQUAL_SPLIT is the default, and is only compatible with zero-out
-      and replace-one adjacency notions, while INDEPENDENT is compatible with
-      the add-remove adjacency notion.
+      truncated_batch_size is set. Determines the neighboring relation and
+      partition type: when set, REPLACE_SPECIAL and EQUAL_SPLIT are used; when
+      None, ADD_OR_REMOVE_ONE and INDEPENDENT are used.
     column_normalize: Whether to column-normalize the strategy matrix.
-    accountant: A privacy accountant that is used to calibrate the noise
-      multiplier. Expected to have an empty state (or calibration may fail).
-      Defaults to PLDAccountant with REPLACE_SPECIAL neighboring_relation.
   """
 
   iterations: int = pydantic.Field(ge=0)
   strategy: np.typing.ArrayLike = pydantic.Field()
-  epsilon: float | None = pydantic.Field(ge=0, allow_inf_nan=True)
-  delta: float | None = pydantic.Field(gt=0, le=1)
   noise_multiplier: float | None = pydantic.Field(default=None, ge=0)
   l2_clip_norm: float = pydantic.Field(default=1.0, ge=0)
   rescale_to_unit_norm: bool = pydantic.Field(default=True)
@@ -286,27 +245,11 @@ class BandMFExecutionPlanConfig:
   sampling_prob: float = pydantic.Field(default=1.0, ge=0, le=1)
   truncated_batch_size: int | None = pydantic.Field(default=None, ge=0)
   num_examples: int | None = pydantic.Field(default=None, ge=0)
-  partition_type: batch_selection.PartitionType = pydantic.Field(
-      default=batch_selection.PartitionType.EQUAL_SPLIT
-  )
   column_normalize: bool = pydantic.Field(default=False)
-  accountant: dp_accounting.PrivacyAccountant = pydantic.Field(
-      default_factory=lambda: dp_accounting.pld.PLDAccountant(
-          NeighboringRelation.REPLACE_SPECIAL
-      )
-  )
 
   def __post_init__(self):
-    _validate_epsilon_delta_noise_multiplier(
-        self.epsilon, self.delta, self.noise_multiplier
-    )
     if self.truncated_batch_size is not None and self.num_examples is None:
       raise ValueError('truncated_batch_size requires num_examples to be set.')
-    _validate_adjacency_relation(
-        self.accountant,
-        self.truncated_batch_size,
-        self.partition_type,
-    )
     strategy = np.asarray(self.strategy)
     if strategy.ndim != 1:
       raise ValueError(f'strategy must be a 1D array, found {strategy.ndim}.')
@@ -334,6 +277,56 @@ class BandMFExecutionPlanConfig:
           sampling_prob=self.sampling_prob,
       )
 
+  def _check_calibrated(self) -> None:
+    """Raises ValueError if noise_multiplier has not been set."""
+    if self.noise_multiplier is None:
+      raise ValueError(
+          'noise_multiplier is not set. Call calibrate() or provide'
+          ' noise_multiplier directly.'
+      )
+
+  def calibrate(
+      self,
+      *,
+      epsilon: float,
+      delta: float,
+      accountant: dp_accounting.PrivacyAccountant | None = None,
+  ) -> 'BandMFExecutionPlanConfig':
+    """Returns a new config with noise_multiplier calibrated from (epsilon, delta).
+
+    Args:
+      epsilon: The target privacy budget.
+      delta: The target privacy failure probability.
+      accountant: A privacy accountant used for calibration. Expected to have an
+        empty state (or calibration may fail). Defaults to PLDAccountant with a
+        neighboring relation derived from the config.
+
+    Returns:
+      A new BandMFExecutionPlanConfig with calibrated noise_multiplier.
+    """
+    if self.num_examples is not None:
+      neighboring_relation = NeighboringRelation.REPLACE_SPECIAL
+    else:
+      neighboring_relation = NeighboringRelation.ADD_OR_REMOVE_ONE
+    if accountant is None:
+      accountant = dp_accounting.pld.PLDAccountant(neighboring_relation)
+    elif accountant.neighboring_relation != neighboring_relation:
+      raise ValueError(
+          'accountant.neighboring_relation='
+          f'{accountant.neighboring_relation} does not match the'
+          ' relation derived from the config:'
+          f' {neighboring_relation}.'
+      )
+
+    noise_multiplier = dp_accounting.calibrate_dp_mechanism(
+        make_fresh_accountant=functools.partial(copy.deepcopy, accountant),
+        make_event_from_param=self._get_dp_event,
+        target_epsilon=epsilon,
+        target_delta=delta,
+    )
+
+    return dataclasses.replace(self, noise_multiplier=noise_multiplier)
+
   @classmethod
   def default(
       cls,
@@ -356,16 +349,12 @@ class BandMFExecutionPlanConfig:
     Returns:
       A BandMFExecutionPlanConfig with an RMSE-optimized strategy.
     """
-
     strategy = toeplitz.optimize_banded_toeplitz(
         n=iterations,
         bands=num_bands,
         max_optimizer_steps=strategy_optimization_steps,
     )
-
-    return BandMFExecutionPlanConfig(
-        iterations=iterations, strategy=strategy, **kwargs
-    )
+    return cls(iterations=iterations, strategy=strategy, **kwargs)
 
   def make(
       self,
@@ -381,7 +370,11 @@ class BandMFExecutionPlanConfig:
     Returns:
       A DPExecutionPlan configured from this config and the given performance
       flags.
+
+    Raises:
+      ValueError: If noise_multiplier has not been set.
     """
+    self._check_calibrated()
     if performance_flags is None:
       performance_flags = PerformanceFlags()
 
@@ -398,28 +391,19 @@ class BandMFExecutionPlanConfig:
           spmd_axis_name=performance_flags.spmd_axis_name,
       )
 
-    query_sensitivity = clipped_grad_transform(lambda: None).sensitivity(
-        self.accountant.neighboring_relation
-    )
-
-    noise_multiplier = self.noise_multiplier
-    if noise_multiplier is None:
-      make_fresh_accountant = functools.partial(copy.deepcopy, self.accountant)
-      noise_multiplier = dp_accounting.calibrate_dp_mechanism(
-          make_fresh_accountant=make_fresh_accountant,
-          make_event_from_param=self._get_dp_event,
-          target_epsilon=self.epsilon,
-          target_delta=self.delta,
-      )
-
-    dp_event = self._get_dp_event(noise_multiplier)
+    if self.num_examples is not None:
+      neighboring_relation = NeighboringRelation.REPLACE_SPECIAL
+      partition_type = batch_selection.PartitionType.EQUAL_SPLIT
+    else:
+      neighboring_relation = NeighboringRelation.ADD_OR_REMOVE_ONE
+      partition_type = batch_selection.PartitionType.INDEPENDENT
 
     batch_selection_strategy = batch_selection.CyclicPoissonSampling(
         sampling_prob=self.sampling_prob,
         iterations=self.iterations,
         cycle_length=len(self.strategy),
         truncated_batch_size=self.truncated_batch_size,
-        partition_type=self.partition_type,
+        partition_type=partition_type,
     )
 
     max_column_norm = np.linalg.norm(self.strategy)
@@ -428,9 +412,17 @@ class BandMFExecutionPlanConfig:
         self.strategy, column_normalize_for_n
     )
 
+    query_sensitivity = clipped_grad_transform(lambda: None).sensitivity(
+        neighboring_relation
+    )
+
+    dp_event = self._get_dp_event(self.noise_multiplier)
+
     privatizer = noise_addition.matrix_factorization_privatizer(
         noising_matrix,
-        stddev=float(noise_multiplier * query_sensitivity * max_column_norm),
+        stddev=float(
+            self.noise_multiplier * query_sensitivity * max_column_norm
+        ),
         prng_key=performance_flags.noise_seed,
         dtype=performance_flags.dtype,
         intermediate_strategy=performance_flags.intermediate_strategy,
@@ -441,4 +433,5 @@ class BandMFExecutionPlanConfig:
         batch_selection_strategy=batch_selection_strategy,
         noise_addition_transform=privatizer,
         dp_event=dp_event,
+        neighboring_relation=neighboring_relation,
     )
