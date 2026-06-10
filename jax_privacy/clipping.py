@@ -28,7 +28,6 @@ import jax.numpy as jnp
 import optax
 from optax import microbatching
 
-
 PyTree: TypeAlias = chex.ArrayTree
 AuxiliaryOutput = collections.namedtuple('Aux', ['values', 'grad_norms', 'aux'])
 _REPLACE_SPECIAL = dp_accounting.NeighboringRelation.REPLACE_SPECIAL
@@ -87,7 +86,7 @@ def clip_pytree(
     nan_safe: bool = True,
     return_zero: bool = False,
 ):
-  """Clips a PyTree of jax arrays based on its global L2 norm or per leaf L2 norm.
+  """Clips a PyTree of jax arrays.
 
   If per_leaf is False:
       Calculates the global L2 norm of the input PyTree. If the norm exceeds
@@ -149,31 +148,38 @@ def clip_pytree(
     pytree = jax.tree.map(nan_to_num, pytree)
   clip_norm = jnp.maximum(clip_norm, 0.0)
 
-  if per_leaf:
-      def _clip_single_leaf(leaf):
-        l2_norm_leaf = jnp.linalg.norm(leaf)
-        scale = jnp.minimum(1.0, clip_norm / l2_norm_leaf)
-        if rescale_to_unit_norm:
-          scale = jax.lax.select(clip_norm > 0, scale / clip_norm, 1.0 / l2_norm_leaf)
-        scale = jnp.nan_to_num(scale, nan=0.0, posinf=0.0)
-        clipped_leaf = jnp.astype(scale, leaf.dtype) * leaf
-        return clipped_leaf, l2_norm_leaf.astype(jnp.float32)
-
-      results_tree = jax.tree.map(lambda l: _clip_single_leaf(l, clip_norm), pytree)
-      clipped = jax.tree.map(lambda r: r[0], results_tree)
-      l2_norms_per_leaf = jax.tree.map(lambda r: r[1], results_tree)
-      l2_norm = jnp.sqrt(sum(n**2 for n in l2_norms_per_leaf))
-  else:
-    l2_norm = optax.global_norm(pytree)
+  def _calculate_scale(l2_norm):
     scale = jnp.minimum(1.0, clip_norm / l2_norm)
     if rescale_to_unit_norm:
-      scale = jax.lax.select(clip_norm > 0, scale / clip_norm, 1 / l2_norm)
+      scale = jax.lax.select(clip_norm > 0, scale / clip_norm, 1.0 / l2_norm)
     # If l2_norm is 0 or nan, set scale to 0.0.
     scale = jnp.nan_to_num(scale, nan=0.0, posinf=0.0)
+    return scale
+
+  if per_leaf:
+    leaves, treedef = jax.tree.flatten(pytree)
+    clipped_leaves = []
+    norm_leaves = []
+
+    for leaf in leaves:
+      l2_norm_leaf = jnp.linalg.norm(leaf)
+      scale = _calculate_scale(l2_norm_leaf)
+      clipped_leaves.append(jnp.astype(scale, leaf.dtype) * leaf)
+      norm_leaves.append(l2_norm_leaf.astype(jnp.float32))
+
+    clipped = jax.tree.unflatten(treedef, clipped_leaves)
+
+    # The list of norms for each leaf, norm_leaves, is used to artificially
+    # construct the l2_norm.
+    l2_norm = jnp.sqrt(jnp.sum(jnp.stack(norm_leaves) ** 2))
+  else:
+    l2_norm = optax.global_norm(pytree)
+    scale = _calculate_scale(l2_norm)
     clipped = jax.tree.map(lambda x: jnp.astype(scale, x.dtype) * x, pytree)
+    l2_norm = l2_norm.astype(jnp.float32)
 
   maybe_zero = lambda x: jax.lax.select(return_zero, jnp.zeros_like(x), x)
-  return jax.tree.map(maybe_zero, clipped), l2_norm.astype(jnp.float32)
+  return jax.tree.map(maybe_zero, clipped), l2_norm
 
 
 def _adjusted_clip_norm(
@@ -429,8 +435,8 @@ def clipped_fun(
       per-example basis. Exercise caution when using this as the sensitivity
       guarantees of the returned Callable are only provided w.r.t. `value`.
     per_layer: If True, the gradient clipping is performed on each leaf of the
-      PyTree. Rather than calculating a global L2 norm, the norm is calculated
-      & clipping threshold is applied on each parameter array of the PyTree.
+      PyTree. Rather than calculating a global L2 norm, the norm is calculated &
+      clipping threshold is applied on each parameter array of the PyTree.
       Currently supports a single value (passed via l2_clip_norm), and applies
       the same value across all leaves.
     batch_argnums: Specifies which argument(s) of `fun` contain the batch
@@ -699,8 +705,8 @@ def clipped_grad(
       Exercise caution when using this as no DP sensitivity guarantees are
       provided for the auxiliary data.
     per_layer: If True, the gradient clipping is performed on each leaf of the
-      PyTree. Rather than calculating a global L2 norm, the norm is calculated
-      & clipping threshold is applied on each parameter array of the PyTree.
+      PyTree. Rather than calculating a global L2 norm, the norm is calculated &
+      clipping threshold is applied on each parameter array of the PyTree.
       Currently supports a single value (passed via l2_clip_norm), and applies
       the same value across all leaves.
     l2_clip_norm: The maximum L2 norm for each per-example gradient. Gradients
